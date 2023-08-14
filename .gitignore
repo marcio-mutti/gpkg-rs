@@ -27,3 +27,5 @@ Cargo.lock
 /Cargo.lock
 .vscode/launch.json
 Localidados_Brasileiras_2010.gpkg
+.vscode/settings.json
+multipoligon.bin

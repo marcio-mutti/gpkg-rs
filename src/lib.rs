@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use geo::{line_string, Coord};
 use sqlite::Value;
 use thiserror::Error;
 
@@ -96,6 +97,10 @@ impl Gpkg {
 
 #[derive(Error, Debug)]
 pub enum GeometryError {
+    #[error("Error trying to decode Point")]
+    PointError,
+    #[error("Malformed Gpkg Geometry hearder")]
+    Malform,
     #[error("Unable to identify bytestream endness")]
     EndNess,
     #[error("Unable to decode bytestream content")]
@@ -104,8 +109,97 @@ pub enum GeometryError {
     TypeIdentifier(u32),
 }
 
-fn bytes_to_wkb(bytes: &[u8]) -> Result<geo::Geometry, GeometryError> {
-    //This need to become a Result
+fn gpkg_geometry(bytes: &[u8]) -> Result<geo::Geometry, GeometryError> {
+    //Interpretar o header
+    // magic number (2 bytes)
+    if let (Some(magic_1), Some(magic_2)) = (bytes.get(0), bytes.get(1)) {
+        if *magic_1 != 0x47 || *magic_2 != 0x50 {
+            return Err(GeometryError::Malform);
+        }
+    } else {
+        return Err(GeometryError::Malform);
+    }
+    //Not caring abou tthe version for now
+    let flags = if let Some(f) = bytes.get(4) {
+        GeoPackageBinary::new(*f)
+    } else {
+        return Err(GeometryError::Malform);
+    };
+    if !flags.valid_envelope() {
+        return Err(GeometryError::Malform);
+    }
+    let srs_id = if let Some(Ok(s)) = bytes.get(4..(4 + 4)).map(|sl| sl.try_into()) {
+        if flags.little_endian() {
+            i32::from_le_bytes(s)
+        } else {
+            i32::from_be_bytes(s)
+        }
+    } else {
+        return Err(GeometryError::Malform);
+    };
+    let envelope_len: usize = match flags.envelope_type {
+        0 => 0,
+        1 => 4,
+        2 | 3 => 6,
+        4 => 8,
+        _ => {
+            return Err(GeometryError::Malform);
+        }
+    };
+    let mut envelope: Vec<f64> = Vec::with_capacity(envelope_len);
+    if let Some(env) = bytes.get(8..(8 + 8 * envelope_len)) {
+        for ck in env.chunks(8) {
+            if let Ok(ck) = ck.try_into() {
+                envelope.push(if flags.little_endian() {
+                    f64::from_le_bytes(ck)
+                } else {
+                    f64::from_be_bytes(ck)
+                });
+            } else {
+                return Err(GeometryError::Malform);
+            }
+        }
+    } else {
+        return Err(GeometryError::Malform);
+    }
+    if let Some(geom_bytes) = bytes.get((8 + 8 * envelope_len)..) {
+        wkb_bytes_to_geo(geom_bytes)
+    } else {
+        Err(GeometryError::Malform)
+    }
+}
+
+struct GeoPackageBinary {
+    empty_geometry: bool,
+    envelope_type: u8,
+    little_endian: bool,
+}
+impl GeoPackageBinary {
+    pub fn new(b: u8) -> Self {
+        let empty_geometry = b & 0b10000 != 0;
+        let envelope_type = b & 0b1110;
+        let little_endian = b & 0b1 != 0;
+        Self {
+            empty_geometry,
+            envelope_type,
+            little_endian,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.empty_geometry
+    }
+    pub fn valid_envelope(&self) -> bool {
+        self.envelope_type < 5
+    }
+    pub fn little_endian(&self) -> bool {
+        self.little_endian
+    }
+    pub fn envelope(&self) -> &u8 {
+        &self.envelope_type
+    }
+}
+
+fn wkb_bytes_to_geo(bytes: &[u8]) -> Result<geo::Geometry, GeometryError> {
     let little_endian = if let Some(endness) = bytes.get(0) {
         if *endness == 1 {
             true
@@ -115,17 +209,77 @@ fn bytes_to_wkb(bytes: &[u8]) -> Result<geo::Geometry, GeometryError> {
     } else {
         return Err(GeometryError::EndNess);
     };
-    let geom_type_num = if let (Some(d0), Some(d1), Some(d2), Some(d3)) =
-        (bytes.get(1), bytes.get(2), bytes.get(3), bytes.get(4))
-    {
-        let type_bytes = [*d0, *d1, *d2, *d3];
+    let geom_type_num = if let Some(Ok(num)) = bytes.get(1..5).map(|sl| sl.try_into()) {
         if little_endian {
-            u32::from_le_bytes(type_bytes)
+            u32::from_le_bytes(num)
         } else {
-            u32::from_be_bytes(type_bytes)
+            u32::from_be_bytes(num)
         }
     } else {
         return Err(GeometryError::Content);
     };
+    let mut f64_stream = Vec::new();
+    for ck in bytes[5..].chunks(8) {
+        if let Ok(ck_array) = ck.try_into() {
+            f64_stream.push(if little_endian {
+                f64::from_le_bytes(ck_array)
+            } else {
+                f64::from_be_bytes(ck_array)
+            });
+        } else {
+            return Err(GeometryError::Content);
+        }
+    }
+    match geom_type_num {
+        1 => {
+            if f64_stream.len() != 2 {
+                return Err(GeometryError::Content);
+            }
+            Ok(geo::geometry::Geometry::Point(geo::geometry::Point::new(
+                *f64_stream.get(0).unwrap(),
+                *f64_stream.get(1).unwrap(),
+            )))
+        }
+        2 => {
+            if f64_stream.len() < 2 || f64_stream.len() % 2 != 0 {
+                return Err(GeometryError::Content);
+            }
+            Ok(geo::geometry::Geometry::LineString(
+                geo::geometry::LineString::new(
+                    f64_stream
+                        .chunks(2)
+                        .map(|fs| Coord {
+                            x: *fs.get(0).unwrap(),
+                            y: *fs.get(1).unwrap(),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            ))
+        }
+        3 => {
+            if f64_stream.len() < 2 || f64_stream.len() % 2 != 0 {
+                return Err(GeometryError::Content);
+            }
+            Ok(geo::geometry::Geometry::Polygon(
+                geo::geometry::Polygon::new(
+                    geo::geometry::LineString::new(
+                        f64_stream
+                            .chunks(2)
+                            .map(|fs| Coord {
+                                x: *fs.get(0).unwrap(),
+                                y: *fs.get(1).unwrap(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    vec![],
+                ),
+            ))
+        }
+        6 => {}
+        k => unimplemented!("Geometry type {k} still not implemented"),
+    }
+}
+
+fn wkb_bytes_to_point(bytes: &[u8]) -> Result<(geo::Point, usize), GeometryError> {
     todo!()
 }
