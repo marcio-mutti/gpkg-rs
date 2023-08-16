@@ -275,11 +275,68 @@ fn wkb_bytes_to_geo(bytes: &[u8]) -> Result<geo::Geometry, GeometryError> {
                 ),
             ))
         }
-        6 => {}
         k => unimplemented!("Geometry type {k} still not implemented"),
     }
 }
 
 fn wkb_bytes_to_point(bytes: &[u8]) -> Result<(geo::Point, usize), GeometryError> {
-    todo!()
+    let mut bytes_consumed = 0_usize;
+    let little_endian = if let Some(byte_order) = bytes.get(0) {
+        match byte_order {
+            1 => true,
+            0 => false,
+            _ => return Err(GeometryError::PointError),
+        }
+    } else {
+        return Err(GeometryError::PointError);
+    };
+    bytes_consumed += 1;
+    let geom_type = if let Some(Ok(type_bytes)) = bytes.get(1..5).map(|b| b.try_into()) {
+        match little_endian {
+            true => i32::from_le_bytes(type_bytes),
+            false => i32::from_be_bytes(type_bytes),
+        }
+    } else {
+        return Err(GeometryError::PointError);
+    };
+    bytes_consumed += 4;
+    if let (Some(Ok(x_bytes)), Some(Ok(y_bytes))) = (
+        bytes.get(5..13).map(|b| b.try_into()),
+        bytes.get(13..21).map(|b| b.try_into()),
+    ) {
+        bytes_consumed += 16;
+        Ok((
+            match little_endian {
+                true => (f64::from_le_bytes(x_bytes), f64::from_le_bytes(y_bytes)).into(),
+                false => (f64::from_be_bytes(x_bytes), f64::from_be_bytes(y_bytes)).into(),
+            },
+            bytes_consumed,
+        ))
+    } else {
+        Err(GeometryError::PointError)
+    }
+}
+
+fn wkb_bytes_to_linearring(bytes: &[u8]) -> Result<(Vec<geo::Point>, usize), GeometryError> {
+    let mut bytes_consumed = 0_usize;
+    let n_points = if let Some(Ok(len_bytes)) = bytes.get(0..4).map(|b| b.try_into()) {
+        i32::from_le_bytes(len_bytes) as usize
+    } else {
+        return Err(GeometryError::Malform);
+    };
+    bytes_consumed += 4;
+    let mut points = Vec::with_capacity(n_points);
+    for _ in 0..n_points {
+        if let Some(bytes) = bytes.get(bytes_consumed..) {
+            if let Ok((point, consumed)) = wkb_bytes_to_point(bytes) {
+                bytes_consumed += consumed;
+                points.push(point);
+            } else {
+                return Err(GeometryError::Malform);
+            }
+        } else {
+            return Err(GeometryError::Malform);
+        }
+    }
+    Ok((points, bytes_consumed))
 }
