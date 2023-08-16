@@ -340,3 +340,43 @@ fn wkb_bytes_to_linearring(bytes: &[u8]) -> Result<(Vec<geo::Point>, usize), Geo
     }
     Ok((points, bytes_consumed))
 }
+
+fn wkb_bytes_to_linestring(bytes: &[u8]) -> Result<(geo::LineString, usize), GeometryError> {
+    let mut bytes_consumed = 0;
+    if let Some(byte_order) = bytes.get(0) {
+        let little_endian = match byte_order {
+            1 => true,
+            _ => false,
+        };
+        bytes_consumed += 1;
+        if let Some(Ok(type_bytes)) = bytes.get(1..5).map(|b| b.try_into()) {
+            let type_assert = match little_endian {
+                true => u32::from_le_bytes(type_bytes),
+                false => u32::from_be_bytes(type_bytes),
+            };
+            if type_assert != 2 {
+                return Err(GeometryError::TypeIdentifier(type_assert));
+            }
+            bytes_consumed += 4;
+            if let Some(Ok(n_points_bytes)) = bytes.get(5..9).map(|b| b.try_into()) {
+                let n_points = match little_endian {
+                    true => u32::from_le_bytes(n_points_bytes),
+                    false => u32::from_be_bytes(n_points_bytes),
+                };
+                bytes_consumed += 4;
+                let mut vec_points = Vec::with_capacity(n_points as usize);
+                for _ in 0..n_points {
+                    if let Some(bytes) = bytes.get(bytes_consumed..) {
+                        if let Ok((point, consumed)) = wkb_bytes_to_point(bytes) {
+                            bytes_consumed += consumed;
+                            vec_points.push(point);
+                        }
+                    }
+                }
+                let line_string = geo::LineString::from(vec_points);
+                return Ok((line_string, bytes_consumed));
+            }
+        }
+    }
+    Err(GeometryError::Malform)
+}
