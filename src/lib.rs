@@ -344,10 +344,7 @@ fn wkb_bytes_to_linearring(bytes: &[u8]) -> Result<(Vec<geo::Point>, usize), Geo
 fn wkb_bytes_to_linestring(bytes: &[u8]) -> Result<(geo::LineString, usize), GeometryError> {
     let mut bytes_consumed = 0;
     if let Some(byte_order) = bytes.get(0) {
-        let little_endian = match byte_order {
-            1 => true,
-            _ => false,
-        };
+        let little_endian = *byte_order == 1;
         bytes_consumed += 1;
         if let Some(Ok(type_bytes)) = bytes.get(1..5).map(|b| b.try_into()) {
             let type_assert = match little_endian {
@@ -375,6 +372,99 @@ fn wkb_bytes_to_linestring(bytes: &[u8]) -> Result<(geo::LineString, usize), Geo
                 }
                 let line_string = geo::LineString::from(vec_points);
                 return Ok((line_string, bytes_consumed));
+            }
+        }
+    }
+    Err(GeometryError::Malform)
+}
+fn wkb_bytes_to_polygon(bytes: &[u8]) -> Result<(geo::Polygon, usize), GeometryError> {
+    let mut bytes_consumed = 0_usize;
+    if let Some(byte_order_byte) = bytes.get(0) {
+        let little_endian = *byte_order_byte == 1u8;
+        bytes_consumed += 1;
+        if let Some(Ok(type_bytes)) = bytes.get(1..5).map(|b| b.try_into()) {
+            let wkbtype = if little_endian {
+                u32::from_le_bytes(type_bytes)
+            } else {
+                u32::from_be_bytes(type_bytes)
+            };
+            bytes_consumed += 4;
+            if wkbtype != 3 {
+                return Err(GeometryError::TypeIdentifier(wkbtype));
+            }
+            if let Some(Ok(nrings_bytes)) = bytes.get(5..9).map(|b| b.try_into()) {
+                let n_rings = if little_endian {
+                    u32::from_le_bytes(nrings_bytes)
+                } else {
+                    u32::from_be_bytes(nrings_bytes)
+                };
+                bytes_consumed += 4;
+                let mut exterior_ring: geo::LineString;
+                let mut interior_rings = Vec::with_capacity(n_rings as usize - 1);
+                for k in 0..n_rings {
+                    if let Some(bytes_offset) = bytes.get(bytes_consumed..) {
+                        match wkb_bytes_to_linestring(bytes_offset) {
+                            Ok((line, n_bytes)) => {
+                                if k == 0 {
+                                    exterior_ring = line;
+                                } else {
+                                    interior_rings.push(line);
+                                }
+                                bytes_consumed += n_bytes;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        return Err(GeometryError::Malform);
+                    }
+                }
+                return Ok((
+                    geo::Polygon::new(exterior_ring, interior_rings),
+                    bytes_consumed,
+                ));
+            }
+        }
+    }
+    Err(GeometryError::Malform)
+}
+
+fn wkb_bytes_to_multipolygon(bytes: &[u8]) -> Result<geo::MultiPolygon, GeometryError> {
+    if let Some(byte_order) = bytes.get(0) {
+        let mut bytes_consumed = 0_usize;
+        let little_endian = *byte_order == 1;
+        bytes_consumed += 1;
+        if let Some(Ok(type_bytes)) = bytes.get(1..5).map(|b| b.try_into()) {
+            bytes_consumed += 4;
+            let geom_type = if little_endian {
+                u32::from_le_bytes(type_bytes)
+            } else {
+                u32::from_be_bytes(type_bytes)
+            };
+            if geom_type != 6 {
+                return Err(GeometryError::TypeIdentifier(geom_type));
+            }
+            if let Some(Ok(n_poly_bytes)) = bytes.get(5..9).map(|b| b.try_into()) {
+                bytes_consumed += 4;
+                let n_polys = if little_endian {
+                    u32::from_le_bytes(n_poly_bytes)
+                } else {
+                    u32::from_be_bytes(n_poly_bytes)
+                };
+                let mut polygons = Vec::with_capacity(n_polys as usize);
+                for _ in 0..n_polys {
+                    if let Some(bytes) = bytes.get(bytes_consumed..) {
+                        match wkb_bytes_to_polygon(bytes) {
+                            Ok((poly, bytes_used)) => {
+                                polygons.push(poly);
+                                bytes_consumed += bytes_used;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        return Err(GeometryError::Malform);
+                    }
+                }
+                return Ok((geo::MultiPolygon::new(polygons)));
             }
         }
     }
