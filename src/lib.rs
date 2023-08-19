@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use geo::{line_string, Coord};
 use sqlite::Value;
 use thiserror::Error;
 
@@ -82,7 +81,10 @@ impl Gpkg {
                     let res = stmt.iter().filter_map(|row_result| match row_result {
                         Ok(row) => {
                             let geom = row.read::<&[u8], _>(0);
-                            None
+                            match wkb_bytes_to_geo(geom) {
+                                Ok(geom) => Some(geom),
+                                Err(_) => None,
+                            }
                         }
                         Err(_) => None,
                     });
@@ -200,83 +202,41 @@ impl GeoPackageBinary {
 }
 
 fn wkb_bytes_to_geo(bytes: &[u8]) -> Result<geo::Geometry, GeometryError> {
-    let little_endian = if let Some(endness) = bytes.get(0) {
-        if *endness == 1 {
-            true
-        } else {
-            false
-        }
-    } else {
-        return Err(GeometryError::EndNess);
-    };
-    let geom_type_num = if let Some(Ok(num)) = bytes.get(1..5).map(|sl| sl.try_into()) {
-        if little_endian {
-            u32::from_le_bytes(num)
-        } else {
-            u32::from_be_bytes(num)
-        }
-    } else {
-        return Err(GeometryError::Content);
-    };
-    let mut f64_stream = Vec::new();
-    for ck in bytes[5..].chunks(8) {
-        if let Ok(ck_array) = ck.try_into() {
-            f64_stream.push(if little_endian {
-                f64::from_le_bytes(ck_array)
+    if let Some(end_byte) = bytes.get(0) {
+        let litte_endian = *end_byte == 1;
+        let mut bytes_consumed = 1_usize;
+        if let Some(Ok(num)) = bytes.get(1..5).map(|b| b.try_into()) {
+            let geom_type_num = if litte_endian {
+                u32::from_le_bytes(num)
             } else {
-                f64::from_be_bytes(ck_array)
-            });
-        } else {
-            return Err(GeometryError::Content);
+                u32::from_be_bytes(num)
+            };
+            bytes_consumed += 5;
+            let (geom, used_bytes) = match geom_type_num {
+                1 => match wkb_bytes_to_point(bytes) {
+                    Ok((geom, used_bytes)) => (geo::Geometry::Point(geom), used_bytes),
+                    Err(e) => return Err(e),
+                },
+                2 => match wkb_bytes_to_linestring(bytes) {
+                    Ok((geom, used_bytes)) => (geo::Geometry::LineString(geom), used_bytes),
+                    Err(e) => return Err(e),
+                },
+                3 => match wkb_bytes_to_polygon(bytes) {
+                    Ok((geom, bytes_used)) => (geo::Geometry::Polygon(geom), bytes_used),
+                    Err(e) => return Err(e),
+                },
+                4 => unimplemented!("Multipoint Geometry"),
+                5 => unimplemented!("MultilineString Not Implemented"),
+                6 => match wkb_bytes_to_multipolygon(bytes) {
+                    Ok((geom, bytes_used)) => (geo::Geometry::MultiPolygon(geom), bytes_used),
+                    Err(e) => return Err(e),
+                },
+                other => return Err(GeometryError::TypeIdentifier(other)),
+            };
+            return Ok(geom);
         }
     }
-    match geom_type_num {
-        1 => {
-            if f64_stream.len() != 2 {
-                return Err(GeometryError::Content);
-            }
-            Ok(geo::geometry::Geometry::Point(geo::geometry::Point::new(
-                *f64_stream.get(0).unwrap(),
-                *f64_stream.get(1).unwrap(),
-            )))
-        }
-        2 => {
-            if f64_stream.len() < 2 || f64_stream.len() % 2 != 0 {
-                return Err(GeometryError::Content);
-            }
-            Ok(geo::geometry::Geometry::LineString(
-                geo::geometry::LineString::new(
-                    f64_stream
-                        .chunks(2)
-                        .map(|fs| Coord {
-                            x: *fs.get(0).unwrap(),
-                            y: *fs.get(1).unwrap(),
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-            ))
-        }
-        3 => {
-            if f64_stream.len() < 2 || f64_stream.len() % 2 != 0 {
-                return Err(GeometryError::Content);
-            }
-            Ok(geo::geometry::Geometry::Polygon(
-                geo::geometry::Polygon::new(
-                    geo::geometry::LineString::new(
-                        f64_stream
-                            .chunks(2)
-                            .map(|fs| Coord {
-                                x: *fs.get(0).unwrap(),
-                                y: *fs.get(1).unwrap(),
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                    vec![],
-                ),
-            ))
-        }
-        k => unimplemented!("Geometry type {k} still not implemented"),
-    }
+    Err(GeometryError::Malform)
 }
 
 fn wkb_bytes_to_point(bytes: &[u8]) -> Result<(geo::Point, usize), GeometryError> {
@@ -291,7 +251,7 @@ fn wkb_bytes_to_point(bytes: &[u8]) -> Result<(geo::Point, usize), GeometryError
         return Err(GeometryError::PointError);
     };
     bytes_consumed += 1;
-    let geom_type = if let Some(Ok(type_bytes)) = bytes.get(1..5).map(|b| b.try_into()) {
+    let _geom_type = if let Some(Ok(type_bytes)) = bytes.get(1..5).map(|b| b.try_into()) {
         match little_endian {
             true => i32::from_le_bytes(type_bytes),
             false => i32::from_be_bytes(type_bytes),
@@ -399,7 +359,7 @@ fn wkb_bytes_to_polygon(bytes: &[u8]) -> Result<(geo::Polygon, usize), GeometryE
                     u32::from_be_bytes(nrings_bytes)
                 };
                 bytes_consumed += 4;
-                let mut exterior_ring: geo::LineString;
+                let mut exterior_ring: geo::LineString = geo::LineString::new(vec![]);
                 let mut interior_rings = Vec::with_capacity(n_rings as usize - 1);
                 for k in 0..n_rings {
                     if let Some(bytes_offset) = bytes.get(bytes_consumed..) {
@@ -428,7 +388,7 @@ fn wkb_bytes_to_polygon(bytes: &[u8]) -> Result<(geo::Polygon, usize), GeometryE
     Err(GeometryError::Malform)
 }
 
-fn wkb_bytes_to_multipolygon(bytes: &[u8]) -> Result<geo::MultiPolygon, GeometryError> {
+fn wkb_bytes_to_multipolygon(bytes: &[u8]) -> Result<(geo::MultiPolygon, usize), GeometryError> {
     if let Some(byte_order) = bytes.get(0) {
         let mut bytes_consumed = 0_usize;
         let little_endian = *byte_order == 1;
@@ -464,7 +424,7 @@ fn wkb_bytes_to_multipolygon(bytes: &[u8]) -> Result<geo::MultiPolygon, Geometry
                         return Err(GeometryError::Malform);
                     }
                 }
-                return Ok((geo::MultiPolygon::new(polygons)));
+                return Ok((geo::MultiPolygon::new(polygons), bytes_consumed));
             }
         }
     }
