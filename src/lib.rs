@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use sqlite::Value;
 use thiserror::Error;
@@ -67,31 +67,35 @@ impl Gpkg {
         &self,
         layer_name: &str,
         columns: Option<&[&str]>,
-    ) -> Result<Vec<(geo::Geometry, Vec<Value>)>, GpkgError> {
-        let columns = match columns {
-            Some(cols) => format!("geom, {}", cols.join(", ")),
-            None => "geom".to_owned(),
+    ) -> Result<Vec<(geo::Geometry, HashMap<String, sqlite::Value>)>, GpkgError> {
+        let query_string = match columns {
+            Some(cols) => format!("SELECT geom, {} from {};", cols.join(", "), layer_name),
+            None => format!("SELECT geom from {};", layer_name),
         };
-        match self
-            .db
-            .prepare(format!("Select {} from 1", columns).as_str())
-        {
-            Ok(mut stmt) => match stmt.bind((1, layer_name)) {
-                Ok(_) => {
-                    let res = stmt.iter().filter_map(|row_result| match row_result {
+        match self.db.prepare(query_string.as_str()) {
+            Ok(mut stmt) => {
+                let res = stmt
+                    .iter()
+                    .filter_map(|row_result| match row_result {
                         Ok(row) => {
                             let geom = row.read::<&[u8], _>(0);
+                            let mut other_values: HashMap<String, sqlite::Value> = HashMap::new();
+                            if let Some(cols) = columns {
+                                for (k, &col) in cols.iter().enumerate() {
+                                    other_values.insert(col.to_owned(), row[k + 1].clone());
+                                }
+                            }
                             match wkb_bytes_to_geo(geom) {
-                                Ok(geom) => Some(geom),
+                                Ok(geom) => Some((geom, other_values)),
                                 Err(_) => None,
                             }
                         }
                         Err(_) => None,
-                    });
-                    todo!()
-                }
-                Err(e) => Err(GpkgError::QueryError(e)),
-            },
+                    })
+                    .collect::<Vec<_>>();
+                // Ok(res)
+                Ok(res)
+            }
             Err(e) => Err(GpkgError::QueryError(e)),
         }
     }
